@@ -1,0 +1,2 @@
+profile=janestreet
+sequence-blank-line = preserve-one # Don't smush my code blocks!
