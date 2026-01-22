@@ -5,6 +5,8 @@ module Day_one = Advent_of_fpga_2025.Day_one
 module Circuit_one = Circuit.With_interface (Day_one.I) (Day_one.O)
 module Day_seven = Advent_of_fpga_2025.Day_seven
 module Circuit_seven = Circuit.With_interface (Day_seven.I) (Day_seven.O)
+module Day_eleven = Advent_of_fpga_2025.Day_eleven
+module Circuit_eleven = Circuit.With_interface (Day_eleven.I) (Day_eleven.O)
 
 let write_verilog ~create =
   let scope = Scope.create ~flatten_design:false () in
@@ -28,5 +30,8 @@ let () =
   | "seven" ->
     write_verilog ~create:(fun scope ->
       Circuit_seven.create_exn ~name:"day_seven" (Day_seven.create scope))
+  | "eleven" ->
+    write_verilog ~create:(fun scope ->
+      Circuit_eleven.create_exn ~name:"day_eleven" (Day_eleven.create scope))
   | _ -> usage ()
 ;;

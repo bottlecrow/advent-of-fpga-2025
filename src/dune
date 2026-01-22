@@ -1,7 +1,7 @@
 (library
  (name advent_of_fpga_2025)
  (public_name advent_of_fpga_2025)
- (modules day_one day_seven)
+ (modules day_one day_seven day_eleven)
  (libraries core core_unix hardcaml hardcaml_circuits)
  (preprocess
   (pps ppx_hardcaml ppx_jane)))
