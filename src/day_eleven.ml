@@ -237,15 +237,15 @@ module Init_graph = struct
     let open Always in
     (* 0 is not a valid id, so we add 1 to the counter _before_ assigning it to a name *)
     let next_id = id_counter.value +:. 1 in
-    let node_edge_idx_offset =
-      node_counter.value *: of_int_trunc ~width:node_id_width 2
+    let node_edges_start_offset =
+      (parent_node_id.value -:. 1) *: of_int_trunc ~width:node_id_width 2
     in
-    let node_edge_len_offset = node_edge_idx_offset +:. 1 in
+    let node_edges_end_offset = node_edges_start_offset +:. 1 in
     let write_name addr id =
       proc
         [ names.write_addr <-- addr; names.write_data <-- id; names.write_enable <-- vdd ]
     in
-    let find_and_set_node node_id name_id_value =
+    let map_name_to_node name_id_value node_id cb =
       proc
         [ when_ (i.value ==:. 3) [ i <--. 4 ] (* delay one cycle to read from names *)
         ; when_
@@ -257,8 +257,9 @@ module Init_graph = struct
                 ; id_counter <-- next_id
                 ]
               @@ else_ [ node_id <-- names.read_data ]
-            ; i <--. 0
+            ; i <--. 5
             ]
+        ; when_ (i.value ==:. 5) (cb @ [ i <--. 0 ])
         ]
     in
     [ sm.switch
@@ -278,14 +279,12 @@ module Init_graph = struct
                        ]
                 ]
             ; names.read_addr <-- parent_name_id.value
-            ; find_and_set_node parent_node_id parent_name_id.value
-            ; when_
-                (parent_node_id.value <>:. 0)
-                [ nodes.write_addr <-- node_edge_idx_offset
+            ; map_name_to_node
+                parent_name_id.value
+                parent_node_id
+                [ nodes.write_addr <-- node_edges_start_offset
                 ; nodes.write_enable <-- vdd
                 ; nodes.write_data <-- edge_counter.value
-                ; nodes.read_addr <-- node_edge_idx_offset
-                ; parent_node_id <--. 0
                 ]
             ] )
         ; ( Child_node
@@ -294,7 +293,7 @@ module Init_graph = struct
                 [ if_
                     (byte.value ==: of_char '\n')
                     [ sm.set_next Parent_node
-                    ; nodes.write_addr <-- node_edge_len_offset
+                    ; nodes.write_addr <-- node_edges_end_offset
                     ; nodes.write_enable <-- vdd
                     ; nodes.write_data <-- edge_counter.value -: nodes.read_data
                     ; parent_name_id <--. 0
@@ -314,14 +313,13 @@ module Init_graph = struct
                        ]
                 ]
             ; names.read_addr <-- child_name_id.value
-            ; find_and_set_node child_node_id child_name_id.value
-            ; when_
-                (child_node_id.value <>:. 0)
+            ; map_name_to_node
+                child_name_id.value
+                child_node_id
                 [ edges.write_addr <-- edge_counter.value
                 ; edges.write_enable <-- vdd
                 ; edges.write_data <-- child_node_id.value
                 ; edge_counter <-- edge_counter.value +:. 1
-                ; child_node_id <--. 0
                 ]
             ] )
         ]

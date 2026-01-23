@@ -116,7 +116,7 @@ let read_memory sim name =
   |> Array.map ~f:Bits.to_int_trunc
 ;;
 
-let print_nodes sim input_str =
+let print_nodes ?(verbose = false) sim input_str =
   let unique_names =
     String.split_on_chars input_str ~on:[ '\n'; ':'; ' ' ]
     |> List.filter ~f:(Fn.non String.is_empty)
@@ -126,17 +126,20 @@ let print_nodes sim input_str =
   let names = read_memory sim "names" in
   let nodes = read_memory sim "nodes" in
   let edges = read_memory sim "edges" in
-  (* printf !"nodes=%{sexp:int array}\n" @@ Array.sub nodes ~pos:0 ~len:30; *)
-  (* printf !"edges=%{sexp:int array}\n" @@ Array.sub edges ~pos:0 ~len:30; *)
   let name_index name =
     String.to_sequence name
     |> Sequence.fold ~init:0 ~f:(fun acc c ->
       (acc * 26) + (Char.to_int c - Char.to_int 'a'))
   in
-  (* List.iter unique_names ~f:(fun name ->
-    let index = name_index name in
-    let node_idx = names.(index) - 1 in
-    printf !"%s -> x%x -> %d\n" name index node_idx); *)
+  if verbose
+  then (
+    printf !"nodes=%{sexp:(int * int * int) list}\n"
+    @@ List.init 15 ~f:(fun i -> i + 1, nodes.(i * 2), nodes.((i * 2) + 1));
+    printf !"edges=%{sexp:int array}\n" @@ Array.sub edges ~pos:0 ~len:30;
+    List.iter unique_names ~f:(fun name ->
+      let index = name_index name in
+      let node_id = names.(index) in
+      printf !"%s -> x%x -> %d\n" name index node_id));
   List.iter unique_names ~f:(fun name ->
     let index = name_index name in
     let node_idx = names.(index) - 1 in
@@ -158,9 +161,9 @@ let%expect_test "init small graph " =
     {|
     aaa[1] edges=(2 3)
     bbb[2] edges=(4 5)
-    ccc[3] edges=(6)
+    ccc[3] edges=()
     ddd[4] edges=()
-    eee[5] edges=()
+    eee[5] edges=(6)
     fff[6] edges=()
     |}]
 ;;
@@ -188,16 +191,16 @@ let%expect_test "init example graph" =
   [%expect
     {|
     aaa[2] edges=(4)
-    bbb[3] edges=(5)
-    ccc[5] edges=(5)
-    dac[11] edges=(12 13)
+    bbb[3] edges=(6)
+    ccc[5] edges=(7 8)
+    dac[11] edges=(10)
     ddd[7] edges=(9)
-    eee[8] edges=(10)
-    fff[10] edges=(10)
-    fft[4] edges=(6)
+    eee[8] edges=(11)
+    fff[10] edges=(12 13)
+    fft[4] edges=(5)
     ggg[12] edges=(14)
     hhh[13] edges=(14)
-    hub[9] edges=(11)
+    hub[9] edges=(10)
     out[14] edges=()
     svr[1] edges=(2 3)
     tty[6] edges=(7 8)
