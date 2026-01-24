@@ -2,6 +2,18 @@ open! Core
 open! Hardcaml
 open! Signal
 
+(*
+   * Advent of Code 2025 - Day 11: Reactor
+   *
+   * A directed acyclic graph represents devices connected by outputs. Each line
+   * of input defines a device and its connections: "name: dest1 dest2 dest3".
+   *
+   * Part 1: Count the total number of distinct paths from "svr" to "out".
+   *
+   * Part 2: Count the number of distinct paths from "svr" to "out" that pass
+   * through both the "dac" and "fft" devices (in any order).
+*)
+
 type solution =
   { part_one : int
   ; part_two : int
@@ -77,7 +89,7 @@ let reference_solution input =
     List.mapi topo_order ~f:(fun i n -> n, i) |> Map.of_alist_exn (module String)
   in
   let count = count_paths_topo ~graph ~topo_order ~topo_map in
-  let part_one = count "you" "out" in
+  let part_one = count "svr" "out" in
   let part_two =
     match Map.find topo_map "fft", Map.find topo_map "dac" with
     | Some fft_idx, Some dac_idx ->
@@ -94,6 +106,8 @@ let reference_solution input =
 let output_width = 32
 let max_nodes = 1024
 let node_id_width = Signal.num_bits_to_represent (max_nodes - 1)
+let max_node_array_len = max_nodes * 2
+let nodes_array_width = Signal.num_bits_to_represent (max_node_array_len - 1)
 let max_edges = max_nodes * 16
 let edge_index_width = Signal.num_bits_to_represent (max_edges - 1)
 let max_children_per_node = 32
@@ -165,7 +179,8 @@ let create_memory ~scope ~name ~clock (module Config : Ram.Dual_port.Config) =
       (Scope.sub_scope scope name)
       { Memory.I.clock; port_a; port_b }
   in
-  { read_addr; read_data = memory.qa; write_addr; write_data; write_enable }
+  let%hw read_data = memory.qa in
+  { read_addr; read_data; write_addr; write_data; write_enable }
 ;;
 
 module Init_graph = struct
@@ -176,24 +191,19 @@ module Init_graph = struct
     [@@deriving sexp_of, compare ~localize, enumerate, string, variants]
   end
 
-  type 'a vars =
-    { sm : 'a Always.State_machine.t
-    ; id_counter : Always.Variable.t
-    ; parent_node_id : Always.Variable.t
-    ; parent_name_id : Always.Variable.t
-    ; child_name_id : Always.Variable.t
-    ; child_node_id : Always.Variable.t
-    ; edge_counter : Always.Variable.t
-    ; node_counter : Always.Variable.t
-    ; i : Always.Variable.t
-    }
-
-  let create_vars scope spec =
+  let handle
+    ~scope
+    ~spec
+    ~(sm : States.t Always.State_machine.t)
+    (byte : _ Uart_byte.t)
+    names
+    nodes
+    edges
+    exit_state_machine
+    : Always.t list
+    =
+    let scope = Scope.sub_scope scope "init_graph" in
     let open Always in
-    let scope = Scope.sub_scope scope "init_graph_vars" in
-    let%hw.Always.State_machine sm =
-      State_machine.create ~auto_wave_format:true (module States) spec
-    in
     let%hw_var id_counter = Variable.reg ~width:node_id_width spec in
     let%hw_var parent_name_id = Variable.reg ~width:name_id_width spec in
     let%hw_var parent_node_id = Variable.reg ~width:node_id_width spec in
@@ -202,43 +212,14 @@ module Init_graph = struct
     let%hw_var edge_counter = Variable.reg ~width:edge_index_width spec in
     let%hw_var node_counter = Variable.reg ~width:node_id_width spec in
     let%hw_var i = Variable.reg ~width:3 spec in
-    { sm
-    ; id_counter
-    ; parent_name_id
-    ; parent_node_id
-    ; child_name_id
-    ; child_node_id
-    ; edge_counter
-    ; node_counter
-    ; i
-    }
-  ;;
-
-  let handle
-    (byte : _ Uart_byte.t)
-    names
-    nodes
-    edges
-    ({ sm
-     ; id_counter
-     ; parent_name_id
-     ; parent_node_id
-     ; child_name_id
-     ; child_node_id
-     ; edge_counter
-     ; node_counter
-     ; i
-     } :
-      States.t vars)
-    exit_state_machine
-    : Always.t list
-    =
     let char_to_ord c = uresize ~width:name_id_width (c -: of_char 'a') in
     let open Always in
     (* 0 is not a valid id, so we add 1 to the counter _before_ assigning it to a name *)
     let next_id = id_counter.value +:. 1 in
     let node_edges_start_offset =
-      (parent_node_id.value -:. 1) *: of_int_trunc ~width:node_id_width 2
+      uresize
+        ~width:nodes_array_width
+        ((parent_node_id.value -:. 1) *: of_int_trunc ~width:nodes_array_width 2)
     in
     let node_edges_end_offset = node_edges_start_offset +:. 1 in
     let write_name addr id =
@@ -330,18 +311,197 @@ end
 module States = struct
   type t =
     | Init_graph
-    | Topo_sort
+    | Setup_search
     | Count_paths
     | End
   [@@deriving sexp_of, compare ~localize, enumerate, string, variants]
 end
 
-let handle_topo_sort (sm : States.t Always.State_machine.t) : Always.t list =
-  [ sm.set_next Count_paths ]
+module Dfs_stack = struct
+  module Entry = struct
+    type 'a t =
+      { node_id : 'a [@bits node_id_width]
+      ; seen : 'a [@bits 2]
+      }
+    [@@deriving hardcaml]
+  end
+
+  module Entry_with_valid = With_valid.Wrap.Make (Entry)
+
+  module I = struct
+    type 'a t =
+      { clock : 'a
+      ; clear : 'a
+      ; push : 'a Entry_with_valid.t
+      ; pop : 'a
+      }
+    [@@deriving hardcaml]
+  end
+
+  module O = struct
+    type 'a t =
+      { top : 'a Entry_with_valid.t
+      ; size : 'a [@bits node_id_width]
+      }
+    [@@deriving hardcaml]
+  end
+
+  let create scope (i : _ I.t) : _ O.t =
+    let scope = Scope.sub_scope scope "dfs_stack" in
+    let spec = Reg_spec.create ~clock:i.clock () in
+    let%hw top_idx = wire node_id_width in
+    let is_empty = top_idx ==:. 0 in
+    let%hw top_next = top_idx +:. 1 in
+    let%hw top_prev = top_idx -:. 1 in
+    let%hw push = i.push.valid in
+    let%hw pop = i.pop &: ~:is_empty in
+    top_idx
+    <-- reg spec ~enable:(push ^: pop) ~clear:i.clear (mux2 push top_next top_prev);
+    let create_stack_slice write_data =
+      (multiport_memory
+         ~name:"stack_mem"
+         max_nodes
+         ~write_ports:
+           [| { write_clock = i.clock
+              ; write_enable = push
+              ; write_address = top_next
+              ; write_data
+              }
+           |]
+         ~read_addresses:[| top_idx |]).(0)
+    in
+    let%hw.Entry.Of_signal top = Entry.map i.push.value ~f:create_stack_slice in
+    { O.top = { With_valid.valid = ~:is_empty; value = top }; size = top_idx }
+  ;;
+end
+
+(* Sequence always actions based on a counter *)
+let sequence ~spec (steps : Always.t list list) =
+  let open Always in
+  let n = List.length steps in
+  let i = Variable.reg ~width:(num_bits_to_represent n) spec in
+  List.mapi steps ~f:(fun j step ->
+    let inc_i = if j = n - 1 then i <--. 0 else i <--. j + 1 in
+    when_ (i.value ==:. j) (step @ [ inc_i ]))
 ;;
 
-let handle_count_paths (sm : States.t Always.State_machine.t) : Always.t list =
-  [ sm.set_next End ]
+module Count_paths = struct
+  module States = struct
+    type t =
+      | Pop_node
+      | Add_edges
+      | End
+    [@@deriving sexp_of, compare ~localize, enumerate, string, variants]
+  end
+
+  type vars =
+    { push : Always.Variable.t Dfs_stack.Entry_with_valid.t
+    ; path_count : Always.Variable.t
+    ; path_count_with_mid_nodes : Always.Variable.t
+    ; key_nodes : Always.Variable.t array
+    }
+
+  let create_vars ~clock scope =
+    let open Always in
+    let scope = Scope.sub_scope scope "count_paths" in
+    let spec = Reg_spec.create ~clock () in
+    let push = Dfs_stack.Entry_with_valid.Of_always.wire Signal.zero in
+    let%hw_var path_count = Variable.reg ~width:output_width spec in
+    let%hw_var path_count_with_mid_nodes = Variable.reg ~width:output_width spec in
+    let%hw_var_array key_nodes =
+      Array.init 3 ~f:(fun _ -> Variable.reg ~width:node_id_width spec)
+    in
+    { push; path_count; path_count_with_mid_nodes; key_nodes }
+  ;;
+
+  let handle
+    ~clock
+    ~scope
+    ~(sm : States.t Always.State_machine.t)
+    (v : vars)
+    nodes
+    edges
+    exit_state
+    : Always.t list
+    =
+    let scope = Scope.sub_scope scope "count_paths_handle" in
+    let spec = Reg_spec.create ~clock () in
+    let open Always in
+    let%hw_var pop = Variable.wire ~default:Signal.gnd () in
+    let stack =
+      Dfs_stack.create
+        scope
+        { clock
+        ; clear = Signal.gnd
+        ; push = Dfs_stack.Entry_with_valid.Of_always.value v.push
+        ; pop = pop.value
+        }
+    in
+    let top = stack.top in
+    let%hw.Dfs_stack.Entry.Of_always search_node = Dfs_stack.Entry.Of_always.reg spec in
+    let%hw_var cur_edge = Variable.reg ~width:edge_index_width spec in
+    let%hw is_mid_node =
+      search_node.node_id.value
+      ==: v.key_nodes.(0).value
+      |: (search_node.node_id.value ==: v.key_nodes.(1).value)
+    in
+    let%hw is_end_node = search_node.node_id.value ==: v.key_nodes.(2).value in
+    let saw_mid_nodes = search_node.seen.value ==:. 2 in
+    let edges_start_offset =
+      uresize
+        ~width:nodes_array_width
+        ((search_node.node_id.value -:. 1) *: of_int_trunc ~width:nodes_array_width 2)
+    in
+    let edges_end_offset = edges_start_offset +:. 1 in
+    let edges_end = Variable.reg ~width:edge_index_width spec in
+    [ sm.switch
+        [ ( Pop_node
+          , sequence
+              ~spec
+              [ [ if_ ~:(top.valid) [ exit_state ]
+                  @@ else_
+                       [ pop <-- vdd
+                       ; Dfs_stack.Entry.Of_always.assign search_node top.value
+                       ]
+                ]
+              ; [ nodes.read_addr <-- edges_start_offset
+                ; when_
+                    is_end_node
+                    [ v.path_count <-- v.path_count.value +:. 1
+                    ; when_
+                        saw_mid_nodes
+                        [ v.path_count_with_mid_nodes
+                          <-- v.path_count_with_mid_nodes.value +:. 1
+                        ]
+                    ]
+                ; when_ is_mid_node [ search_node.seen <-- search_node.seen.value +:. 1 ]
+                ]
+              ; [ cur_edge <-- nodes.read_data; nodes.read_addr <-- edges_end_offset ]
+              ; [ edges_end <-- nodes.read_data; sm.set_next Add_edges ]
+              ] )
+        ; ( Add_edges
+          , [ if_ (cur_edge.value ==: edges_end.value) [ sm.set_next Pop_node ]
+              @@ else_
+              @@ sequence
+                   ~spec
+                   [ [ edges.read_addr <-- cur_edge.value ]
+                   ; [ v.push.value.node_id <-- edges.read_data
+                     ; v.push.value.seen <-- search_node.seen.value
+                     ; v.push.valid <-- vdd
+                     ; cur_edge <-- cur_edge.value +:. 1
+                     ]
+                   ]
+            ] )
+        ; End, [ exit_state ]
+        ]
+    ]
+  ;;
+end
+
+let name_index name =
+  String.to_sequence name
+  |> Sequence.fold ~init:0 ~f:(fun acc c ->
+    (acc * 26) + (Char.to_int c - Char.to_int 'a'))
 ;;
 
 let create scope ({ clock; clear; byte_in } : _ I.t) : _ O.t =
@@ -353,7 +513,7 @@ let create scope ({ clock; clear; byte_in } : _ I.t) : _ O.t =
   end
   in
   let module Nodes_config = struct
-    let address_bits = node_id_width * 2
+    let address_bits = nodes_array_width
     let data_bits = edge_index_width
   end
   in
@@ -365,40 +525,65 @@ let create scope ({ clock; clear; byte_in } : _ I.t) : _ O.t =
   let names = create_memory ~scope ~name:"names" ~clock (module Names_config) in
   let nodes = create_memory ~scope ~name:"nodes" ~clock (module Nodes_config) in
   let edges = create_memory ~scope ~name:"edges" ~clock (module Edges_config) in
-  let init_graph_vars = Init_graph.create_vars scope spec in
+  let count_paths_vars = Count_paths.create_vars ~clock scope in
   let%hw_var done_signal = Variable.wire ~default:Signal.gnd () in
-  let%hw_var part_one = Variable.wire ~default:(Signal.zero output_width) () in
-  let%hw_var part_two = Variable.wire ~default:(Signal.zero output_width) () in
   let%hw.Always.State_machine sm =
     State_machine.create ~auto_wave_format:true (module States) spec
   in
+  let%hw.Always.State_machine init_graph_sm =
+    State_machine.create ~auto_wave_format:true (module Init_graph.States) spec
+  in
+  let%hw.Always.State_machine count_paths_sm =
+    State_machine.create ~auto_wave_format:true (module Count_paths.States) spec
+  in
+  let push = count_paths_vars.push in
+  let key_nodes = count_paths_vars.key_nodes in
   compile
     [ sm.switch
         [ ( Init_graph
-          , [ proc
-              @@ Init_graph.handle
-                   byte_in
-                   names
-                   nodes
-                   edges
-                   init_graph_vars
-                   (sm.set_next Topo_sort)
-            ] )
-        ; Topo_sort, handle_topo_sort sm
-        ; Count_paths, handle_count_paths sm
-        ; ( End
-          , [ nodes.read_addr <--. 1
-            ; edges.read_addr <--. 1
-            ; part_one <-- uresize ~width:output_width nodes.read_data
-            ; part_two <-- uresize ~width:output_width edges.read_data
-            ; done_signal <-- vdd
-            ] )
+          , Init_graph.handle
+              ~scope
+              ~spec
+              ~sm:init_graph_sm
+              byte_in
+              names
+              nodes
+              edges
+              (sm.set_next Setup_search) )
+        ; ( Setup_search
+          , sequence
+              ~spec
+              [ [ names.read_addr <-- of_int_trunc ~width:name_id_width (name_index "svr")
+                ]
+              ; [ push.value.node_id <-- names.read_data
+                ; push.value.seen <-- of_int_trunc ~width:2 0
+                ; push.valid <-- vdd
+                ; names.read_addr <-- of_int_trunc ~width:name_id_width (name_index "dac")
+                ]
+              ; [ key_nodes.(0) <-- names.read_data
+                ; names.read_addr <-- of_int_trunc ~width:name_id_width (name_index "fft")
+                ]
+              ; [ key_nodes.(1) <-- names.read_data
+                ; names.read_addr <-- of_int_trunc ~width:name_id_width (name_index "out")
+                ]
+              ; [ key_nodes.(2) <-- names.read_data; sm.set_next Count_paths ]
+              ] )
+        ; ( Count_paths
+          , Count_paths.handle
+              ~clock
+              ~scope
+              ~sm:count_paths_sm
+              count_paths_vars
+              nodes
+              edges
+              (sm.set_next End) )
+        ; End, [ done_signal <-- vdd ]
         ]
     ];
   { With_valid.valid = done_signal.value
   ; value =
-      { O.Results.part_one = part_one.value
-      ; part_two = part_two.value
+      { O.Results.part_one = count_paths_vars.path_count.value
+      ; part_two = count_paths_vars.path_count_with_mid_nodes.value
       ; state = sm.current
       }
   }
